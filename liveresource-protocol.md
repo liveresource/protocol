@@ -1,85 +1,147 @@
-LiveResource Protocol
-=====================
+# LiveResource Protocol
 
-Many web services are built using RESTful design patterns surrounding objects and collections, and front-end developers are comfortable working with these kinds of services. What if we just had a way to notify when objects/collections were updated?
+LiveResource is a protocol for receiving live updates of web resources. Resources may be of any kind, for example REST API endpoints or files. The protocol aims to to be simple, minimal, and align with HTTP/REST conventions.
 
-This document describes a realtime updates protocol based around web resources. Resources indicate support for realtime updates using Link headers in HTTP responses. For example:
+## Design goals
 
-    GET /resource HTTP/1.1
-    ...
+* Given a resource URL, it should be possible for a receiving entity to listen for updates of the resource at that URL.
+* It should be possible to deliver updates instantly, without the recipient needing to poll.
+* It should be possible to listen for three types of updates:
+    1. The entire content of a resource.
+    2. Only the content of a resource that has changed.
+    3. An indication that a resource has changed without necessarily providing any of its content (aka an update "hint").
+* HTTP concepts should be reused where possible, for example ETags for resource versioning.
+* HTTP should be preferred as the data transport where possible, but alternative protocols such as WebSockets may be used to work around HTTP limitations.
+* The protocol should be able to work efficiently with HTTP/2.
+* Resources should be able to use any content type, including binary content. Put another way, resource content should not be limited to JSON. This ensures the protocol remains future-proof.
+* Servers should have an incremental upgrade path, so that some benefits of the protocol can be realized without needing to implement it in its entirety.
+* Simple servers, complex clients. Related to the previous point, client libraries should try to support as much of the protocol as makes sense for the target platform, to ensure compatiblity with a variety of servers that may only implement specific parts.
 
-    HTTP/1.1 200 OK
-    Link: </resource>; rel="value-wait value-stream"
-    Link: </resource/subscription/>; rel=value-callback
-    ...
+## Overview
 
-This information can also be obtained with the HEAD method, if you want to see what a resource supports without receiving its content.
+Resources advertise support for live updates by including certain HTTP response headers.
 
-There are two notification types ("value" and "changes") and three notification mechanisms ("wait", "stream", and "callback"). As a result, the following link relations are defined based on the various possible combinations:
+For example, suppose a client requests a resource:
 
-Link rel             | Meaning
--------------------- | ----------------------------------------------------------------------------------------------------
-value-wait           | Long-polling updates of a resource's entire value
-value-stream         | Server-sent events (SSE) updates of a resource's entire value
-value-callback       | Base URI for subscription management of HTTP callback (webhook) updates of a resource's entire value
-changes              | Immediate updates of a collection's children
-changes-wait         | Long-polling updates of a collection's children
-changes-stream       | Server-sent events (SSE) updates of a collection's children
-changes-callback     | Base URI for subscription management of HTTP callback (webhook) updates of a collection's children
+{% highlight http %}
+GET /resource HTTP/1.1
+{% endhighlight %}
 
-The "changes" link type is an outlier, used to poll a collection resource for changes immediately without any deferred response behavior. A similar link type is not needed for "value" polling since this is assumed to be possible with a plain GET on the resource.
+The response from the server may include `Link` headers indicating various live update mechanisms:
+
+{% highlight http %}
+HTTP/1.1 200 OK
+Link: </resource>; rel="value-wait value-stream"
+Link: </resource/subscription/>; rel=value-callback
+...
+{% endhighlight %}
+
+This information can also be obtained by making a HEAD request, if the client wants to see what a resource supports without retrieving its content.
+
+The client can then listen for updates by making use of the advertised mechanisms.
+
+## Update types
+
+There are three update types:
+
+* Value: The entire value of a resource, headers and content.
+* Changes: Data indicating the changed parts of a resource. The LiveResource protocol does not define a specific format for changes. The server may use any data format to represent changes of a resource. For example, it could return a subset of items in the case of an updated collection, or a text diff, or a JSON patch to show the changes of a JSON object, etc. It is up to clients to know how to interpret such payloads.
+* Hint: An indication that the resource has changed without providing any of resource data. When a client receives a hint, it will need to make a separate GET request to retrieve the data.
+
+## Update mechanisms
+
+There are five update mechanisms:
+
+* Plain-polling: The client polls the resource on an interval to retrieve the latest data.
+* Long-polling: The client makes a request and the server waits until the resource has changed before responding.
+* Stream: The client listens for updates using the Server-Sent Events protocol.
+* Socket: The client listens for updates using WebSockets.
+* Callback: The receiver registers a callback URL that the server should make requests to when the resource has changed.
+
+## Link types
+
+`Link` headers are used to indicate live update mechanisms. Given the various update types and update mechanisms, the following link relations are defined based on the possible combinations:
+
+Link rel           | Meaning
+------------------ | ----------------------------------------------------------------------------------------------------
+`value-wait`       | Long-polling updates of a resource's entire value
+`value-stream`     | Server-sent events (SSE) updates of a resource's entire value
+`value-callback`   | Base URI for subscription management of HTTP callback (webhook) updates of a resource's entire value
+`changes`          | Immediate updates of the changes of a resource
+`changes-wait`     | Long-polling updates of the changes of a resource
+`changes-stream`   | Server-sent events (SSE) updates of the changes of a resource
+`changes-callback` | Base URI for subscription management of HTTP callback (webhook) updates of the changes of a resource
+`hint`             | Immediate check to see if a resource has changed
+`hint-wait`        | Long-polling updates of hints that a resource has changed
+`hint-stream`      | Server-sent events (SSE) updates of hints that a resource has changed
+`hint-callback`    | Base URI for subscription management of HTTP callback (webhook) updates of hints that a resource has changed
+
+The `changes` and `hint` link types are not live update mechanisms, but are used to indicate pull mechanisms for update types which cannot be assumed to exist but are needed in certain contexts (e.g. recovery after connection loss, plain polling, or use with `multiplex-socket` as described below). There is no `value` link type since it is implied that all resources support this by making a GET request on the original resource URL.
 
 Additionally, there are link types for multiplexing:
 
-Link rel             | Meaning
--------------------- | ----------------------------------------------------------------------------------------------------
-multiplex-wait       | Base URI for accessing multiple resources in a single request, with support for long-polling
-multiplex-stream     | Base URI for accessing multiple resources via a single server-sent events (SSE) stream
-multiplex-ws         | Base URI for accessing multiple resources via a single WebSocket connection
+Link rel           | Meaning
+------------------ | ----------------------------------------------------------------------------------------------------
+`multiplex-wait`   | Base URI for accessing multiple resources in a single request, with support for long-polling
+`multiplex-socket` | Base URI for accessing multiple resources via a single WebSocket connection
 
-Below, we'll go over how the long-polling mechanisms can be used with common web objects and collections.
+Some link relations imply others:
 
-Objects
--------
+Link rel           | Implies
+------------------ | -----------
+`changes-wait`     | `changes`
+`hint-wait`        | `hint`
 
-Object resources may announce support for updates via long-polling by including an ETag and appropriate Link header:
+## Update protocols
 
-    GET /object HTTP/1.1
-    ...
+### Long-polling
 
-    HTTP/1.1 200 OK
-    ETag: "b1946ac9"
-    Link: </object>; rel=value-wait
-    ...
+Resources may announce support for updates via long-polling by including an `ETag` and appropriate `Link` header:
 
-To make use of the value-wait link, the client issues a GET to the linked URI with the If-None-Match header set to the value of the received ETag. The client also provides the Wait header with a timeout value in seconds.
+{% highlight http %}
+GET /object HTTP/1.1
+...
 
-    GET /object HTTP/1.1
-    If-None-Match: "b1946ac9"
-    Wait: 60
-    ...
+HTTP/1.1 200 OK
+ETag: "b1946ac9"
+Link: </object>; rel=value-wait
+...
+{% endhighlight %}
+
+To make use of the `value-wait` link, the client issues a GET to the linked URI with the `If-None-Match` header set to the value of the received `ETag`. The client also provides the `Wait` header with a timeout value in seconds.
+
+{% highlight http %}
+GET /object HTTP/1.1
+If-None-Match: "b1946ac9"
+Wait: 60
+...
+{% endhighlight %}
 
 If the data changes while the request is open, then the new data is returned:
 
-    HTTP/1.1 200 OK
-    ETag: "2492d234"
-    Link: </object>; rel=value-wait
-    ...
+{% highlight http %}
+HTTP/1.1 200 OK
+ETag: "2492d234"
+Link: </object>; rel=value-wait
+...
+{% endhighlight %}
 
 If the data does not change, then a 304 is returned:
 
-    HTTP/1.1 304 Not Modified
-    ETag: "b1946ac9"
-    Link: </object>; rel=value-wait
-    Content-Length: 0
+{% highlight http %}
+HTTP/1.1 304 Not Modified
+ETag: "b1946ac9"
+Link: </object>; rel=value-wait
+{% endhighlight %}
 
 If the object is deleted while the request is open, then a 404 is returned:
 
-    HTTP/1.1 404 Not Found
-    ...
+{% highlight http %}
+HTTP/1.1 404 Not Found
+...
+{% endhighlight %}
 
-Collections
------------
+### Collections
 
 Like objects, collection resources announce support via Link headers:
 
@@ -106,8 +168,7 @@ Any request can be made against the collection to receive a changes URIs. For ex
 
 This spec does not dictate the format of a collections response, but it does make the following requirements: 1) Elements in a collection MUST have an id value somewhere, that if concatenated with the collection resource would produce a direct link to the object it represents, and 2) Elements in a collection SHOULD have a deleted flag, to support checking for deletions. Clients must be able to understand the format of the collections they interact with, and be able to determine the id or deleted state of any such items.
 
-Webhooks
---------
+### Webhooks
 
 A resource can indicate support for update notifications via callback by including a "callback" Link type:
 
@@ -148,8 +209,7 @@ In the case of object resources, the body of the POST request contains the entir
 
 For collection resources, the POST request body contains the response that would normally have been sent to a request for the changes URI. The request should also contain two Link headers, with rel=changes and rel=prev-changes. The recipient can compare the currently known changes link with the prev-changes link to ensure a callback was not missed. If it was, the client can resync by performing a GET against the currently known changes link.
 
-Server-Sent Events
-------------------
+### Server-Sent Events
 
 A resource can indicate support for notifications via Server-Sent Events by including a "stream" Link type:
 
@@ -172,8 +232,7 @@ The link points to a Server-Sent Events capable endpoint that streams updates re
 
 Event ids should be used to allow recovery after disconnect. For example, an object resource might use ETags for event ids. Events are not named. For value-stream URIs, each event is a JSON value of the object itself, or an empty string if the object was deleted. For changes-stream URIs, each event is a JSON object of the same format that is normally returned when retrieving elements from the collection (e.g. a JSON list).
 
-Multiplexing
-------------
+### Multiplexing
 
 In order to reduce the number of needed TCP connections in client applications, servers may support multiplexing many long-polling requests or Server-Sent Events connections together. This is indicated by providing Links of type "multiplex-wait" and/or "multiplex-stream". For example, suppose there are two object URIs of interest:
 
@@ -226,8 +285,7 @@ Multiplexing SSE is also possible:
 
 In this case, each message is encapsulated in a JSON object, with "uri" and "body" fields. The "uri" field contains the URI that the message is for. The "body" field contains a JSON-parsed value of what would normally have been sent over a non-multiplexed SSE connection. If the value is empty, then "body" should be set to null or not included.
 
-WebSockets
-----------
+### WebSockets
 
 A resource can indicate support for notifications via WebSocket by including a "multiplex-ws" Link type:
 
@@ -282,58 +340,3 @@ For changes:
     }
 
 Notifications do not have guaranteed delivery. The client can detect for errors and recover by fetching the original URI or the changes URI.
-
-JavaScript API
---------------
-
-It should be possible to create a simple JavaScript API that supports fetching and syncing against web resources that conform to the above spec.
-
-Example usage for objects:
-
-    // get and listen for updates of a user profile resource
-    var user = new LiveResource('http://example.com/users/justin');
-
-    user.on('value', function(data) {
-      // the content of the 'justin' resource has been initially received or changed
-    });
-
-    user.on('removed', function() {
-      // the 'justin' resource has been removed
-    });
-
-Example usage for collections:
-
-    // fetch the first 20 items in justin's contact list ordered by first name.
-    //   this will also return an updates URI for the resource, which will be
-    //   utilized in the background to listen for updates going forward
-    var contacts = new LiveResource(
-      'http://example.com/users/justin/contacts/?order=first&max=20'
-    );
-
-    contacts.on('child-added', function(item) {
-      // an item was created, with uri {contacts.uri}/{item.id}/
-    });
-
-    contacts.on('child-changed', function(item) {
-      // an item was changed, with uri {contacts.uri}/{item.id}/
-    });
-
-    contacts.on('child-removed', function(item_id) {
-      // an item was removed, with uri {contacts.uri}/{item_id}/
-    });
-
-    // if there was other metadata in the response that would be useful out of band,
-    //   then it can be obtained through the object. e.g. contacts.initialRequest.responseHeaders
-    //   could be used to fish out a Link rel=next for paging to the next 20 items
-    //   of the contact list ordered by first name.
-
-    // if the app already has the updates link to use and doesn't want the JS API to
-    //   perform any initial query, it can be specified directly. for example, this could
-    //   happen if the app already accessed the collection using some separate AJAX
-    //   calls, or if the updates URI was written directly into the HTML by the server
-    //   when serving the page.
-    var contacts = new LiveResource({
-        'updates': 'http://example.com/users/justin/contacts/?after=1395174448&max=50'
-    });
-
-The JavaScript API implementation could start by using long-polling for updates and then attempt an upgrade to Server-Sent Events for compatible browsers.
