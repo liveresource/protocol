@@ -8,7 +8,7 @@ LiveResource is a protocol for receiving live updates of web resources. Resource
 * It should be possible for the server to deliver updates instantly, without the recipient needing to poll.
 * It should be possible to listen for three types of updates:
     1. The entire content of a resource.
-    2. Only the content of a resource that has changed.
+    2. Only the changed content of a resource.
     3. An indication that a resource has changed without necessarily providing any of its content (aka an update "hint").
 * HTTP concepts should be reused where possible, for example ETags for resource versioning.
 * HTTP should be preferred as the data transport where possible, but alternative protocols such as WebSockets may be used to work around HTTP limitations.
@@ -25,20 +25,27 @@ For example, suppose a client requests a resource:
 
 ```http
 GET /resource HTTP/1.1
+Host: example.org
 ```
 
-The response from the server may include `Link` headers indicating various live update mechanisms:
+The response from the server may include `LiveResource-Property` headers and/or `Link` headers indicating various live update mechanisms:
 
 ```http
 HTTP/1.1 200 OK
-Link: </resource>; rel="value-wait value-stream"
-Link: </resource/subscription/>; rel=value-callback
+ETag: "b1946ac9"
+LiveResource-Property: wait; min=20
+Link: </resource>; rel=alternate; type=text/event-stream
+Link: </resource/subscriptions/>; rel=http://liveresource.org/protocol/callbacks
 ...
 ```
 
-This information can also be obtained by making a HEAD request, if the client wants to see what a resource supports without retrieving its content.
+This information can also be obtained by making a HEAD request, if the client wants to see what a resource supports without having to retrieving its content.
 
-The client can then listen for updates by making use of the advertised mechanisms.
+The client can then listen for updates by making use of the advertised mechanisms. In the above example, the supplied headers would mean:
+
+* Long-polling for updates is possible by making a GET request to `http://example.org/resource/`, with request headers `If-None-Match: "b1946ac9"` and `Prefer: wait={timeout}`.
+* Receiving a Server-Sent Events stream is possible by making a GET request to `http://example.org/resource/`, with request header `Accept: text/event-stream`.
+* Webhooks may be registered by making a POST request to `http://example.org/resource/subscriptions/`, with parameter `callback_uri` set to the URL to receive updates.
 
 ## Update types
 
@@ -47,6 +54,8 @@ There are three update types:
 * Value: The entire value of a resource, headers and content.
 * Changes: Data indicating the changed parts of a resource. The LiveResource protocol does not define a specific format for changes. The server may use any data format to represent changes of a resource. For example, it could return a subset of items in the case of an updated collection, or a text diff, or a JSON patch to show the changes of a JSON object, etc. It is up to clients to know how to interpret such payloads.
 * Hint: An indication that the resource has changed without providing any of resource data. When a client receives a hint, it will need to make a separate GET request to retrieve the data.
+
+When a client listens for updates, it chooses to listen for either value updates or changes updates. The use of hints is decided by the server. For example, a client might listen for value updates, but the server could choose to deliver hints rather than values, or potentially a mix of both hints and values.
 
 ## Update mechanisms
 
@@ -58,55 +67,48 @@ There are five update mechanisms:
 * Socket: The client listens for updates using WebSockets.
 * Callback: The receiver registers a callback URL that the server should make requests to when the resource has changed.
 
-## Link types
+## Resource properties
 
-`Link` headers are used to indicate live update mechanisms. Given the various update types and update mechanisms, the following link relations are defined based on the possible combinations:
+`LiveResource-Property` headers are used to indicate capabilities of the resource itself.
 
-Link rel           | Meaning
------------------- | ----------------------------------------------------------------------------------------------------
-`value-wait`       | Long-polling updates of a resource's entire value
-`value-stream`     | Server-sent events (SSE) updates of a resource's entire value
-`value-callback`   | Base URI for subscription management of HTTP callback (webhook) updates of a resource's entire value
-`changes`          | Immediate updates of the changes of a resource
-`changes-wait`     | Long-polling updates of the changes of a resource
-`changes-stream`   | Server-sent events (SSE) updates of the changes of a resource
-`changes-callback` | Base URI for subscription management of HTTP callback (webhook) updates of the changes of a resource
-`hint`             | Immediate check to see if a resource has changed
-`hint-wait`        | Long-polling updates of hints that a resource has changed
-`hint-stream`      | Server-sent events (SSE) updates of hints that a resource has changed
-`hint-callback`    | Base URI for subscription management of HTTP callback (webhook) updates of hints that a resource has changed
+Property         | Meaning
+---------------- | ----------------------------------
+`wait`           | The resource supports long-polling.
+`multiplex=type` | The resource URI may be used with a multiplex transport. Allowed values are `request`, `socket`, `callbacks`, and `required`. More than one value can be provided using a quoted concatenated string, e.g. `multiplex="request socket"`. The `required` value is not a multiplex transport type, but a special value that indicates the resource MUST be used with a multiplex transport.
 
-The `changes` and `hint` link types are not live update mechanisms, but are used to indicate pull mechanisms for update types which cannot be assumed to exist but are needed in certain contexts (e.g. recovery after connection loss, plain polling, or use with `multiplex-socket` as mentioned below). There is no `value` link type since it is implied that all resources support this by making a GET request on the original resource URL.
+Note: only the long-polling mechanism is advertised as a property of the resource itself. The stream, socket, and callback mechanisms usually involve working with different URIs, and so `Link` headers are used for those instead (see next section).
 
-Additionally, there are link types for multiplexing:
+## Links
+
+`Link` headers are used to indicate capabilities available at potentially different URIs than the resource of interest.
 
 Link rel           | Meaning
 ------------------ | ----------------------------------------------------------------------------------------------------
-`multiplex-wait`   | Base URI for accessing multiple resources in a single request, with support for long-polling
-`multiplex-socket` | Base URI for accessing multiple resources via a single WebSocket connection
+`http://liveresource.org/protocol/changes`             | Changes to the resource. The URI will almost always include some kind of checkpoint information, e.g. `/resource/?after=1`.
+`alternate`                                            | This can be used to specify an alternate location to use for long-polling (by including a `wait-min` parameter as indication), or the location to use for the stream mechanism (by including a `type` parameter set to `text/event-stream`).
+`http://liveresource.org/protocol/callbacks`           | Base URI for subscription management of HTTP callback (webhook) updates of the entire value of the resource.
+`http://liveresource.org/protocol/changes-callbacks`   | Base URI for subscription management of HTTP callback (webhook) updates of the changed parts of the resource.
+`http://liveresource.org/protocol/multiplex-request`   | Base URI for accessing multiple resources in a single request. This URI MUST support long-polling.
+`http://liveresource.org/protocol/multiplex-socket`    | Base URI for accessing multiple resources via a single WebSocket connection.
+`http://liveresource.org/protocol/multiplex-callbacks` | Base URI for subscription management of HTTP callback (webhook) updates of multiple resources.
 
-Some link relations imply others:
+The custom relationship types have very long names because they are not registered with the IANA yet. The intent is that types could eventually be registered using the leaf part (e.g. `changes`, `callbacks`, `multiplex-socket`, etc).
 
-Link rel           | Implies
------------------- | -----------
-`changes-wait`     | `changes`
-`hint-wait`        | `hint`
-
-## Update protocols
+## Protocol
 
 ### Plain-polling
 
-For plain polling, the client repeatedly retrieves the resource URL on an interval. By default, it is RECOMMENDED that clients don't poll a URL more frequently than once every 2 minutes. Servers MAY indicate a preferred interval by providing an `X-Poll-Interval` response header with a value in seconds. Clients SHOULD allow configuring an interval to use in situations where the server does not provide `X-Poll-Interval` *and* the client knows that a non-default interval is acceptable.
+For plain polling, the client repeatedly retrieves the resource URI on an interval. By default, it is RECOMMENDED that clients don't poll a URL more frequently than once every 2 minutes. Servers MAY indicate a preferred interval by providing an `X-Poll-Interval` response header with a value in seconds. Clients SHOULD allow configuring an interval to use in situations where the server does not provide `X-Poll-Interval` *and* the client knows that a non-default interval is acceptable.
 
-For value updates, the client polls the resource URL.
+For value updates, the client polls the resource URI.
 
-For changes updates, the client polls a `changes` link if provided.
+For changes updates, the client polls a `http://liveresource.org/protocol/changes` link if provided.
 
-For hint updates, the client makes a conditional request to the `hint` link (which may be the same as the resource URL) using a HEAD request with `If-None-Match`. Clients MAY attempt to probe for a server's ability to support such requests, in the absence of a `hint` link.
+This protocol does not specify a way to receive hint updates with plain-polling.
 
 ### Long-polling
 
-Resources may announce support for value updates via long-polling by including an `ETag` and appropriate `Link` header:
+Resources may announce support for value updates via long-polling by including `ETag` and `LiveResource-Property` headers:
 
 ```http
 GET /object HTTP/1.1
@@ -114,16 +116,16 @@ GET /object HTTP/1.1
 
 HTTP/1.1 200 OK
 ETag: "b1946ac9"
-Link: </object>; rel=value-wait
+LiveResource-Property: wait; min=20
 ...
 ```
 
-To make use of the `value-wait` link, the client issues a GET to the linked URI with the `If-None-Match` header set to the value of the received `ETag`. The client also provides the `Wait` header with a timeout value in seconds.
+To make use of long-polling the client issues a GET to the resource URI with the `If-None-Match` header set to the value of the received `ETag`. The client also provides the `Prefer` header with a `wait` timeout value in seconds.
 
 ```http
 GET /object HTTP/1.1
 If-None-Match: "b1946ac9"
-Wait: 60
+Prefer: wait=60
 ...
 ```
 
@@ -132,16 +134,15 @@ If the data changes while the request is open, then the new data is returned:
 ```http
 HTTP/1.1 200 OK
 ETag: "2492d234"
-Link: </object>; rel=value-wait
+LiveResource-Property: wait; min=20
 ...
 ```
 
-If the data does not change, then a 304 is returned:
+If the data does not change, then 304 is returned:
 
 ```http
 HTTP/1.1 304 Not Modified
 ETag: "b1946ac9"
-Link: </object>; rel=value-wait
 ```
 
 If the object is deleted while the request is open, then a 404 is returned:
@@ -151,36 +152,60 @@ HTTP/1.1 404 Not Found
 ...
 ```
 
-Changes are supported in a similar way. The resource announces support via `Link` headers:
+Changes are supported in a similar way. The resource announces support for changes via a `Link` header:
 
 ```http
-GET /collection/ HTTP/1.1
+HEAD /collection/ HTTP/1.1
 ...
 
 HTTP/1.1 200 OK
-Link: </collection/?after=1395174448&max=50>; rel="changes changes-wait"
+Link: </collection/?after=1395174448&max=50>; rel=http://liveresource.org/protocol/changes
 ...
 ```
 
-Unlike value updates which use ETags, changes updates encode a checkpoint in the provided `changes` and/or `changes-wait` URIs. The client should request against these URIs to receive updates of the resource. The `changes-wait` URI is used for long-polling.
+Before the changes link can be long-polled, the client needs to know whether or not it supports it. This can be done two ways. One is to request the changes link and look for the `wait` property:
 
-The changes URIs should return all changes that have occurred after some recent checkpoint (such as the current time). If no changes have occurred, the response must have a way to indicate this (e.g. empty body, empty JSON object or list, etc). Regardless of whether there were changes or not, the response code SHOULD be 200.
+```http
+HEAD /collection/?after=1395174448&max=50 HTTP/1.1
+...
 
-The changes URIs MAY have a limited validity period. If the server considers a URI too old to process, it can return 404, which should signal the client to start over and obtain fresh changes URIs.
+HTTP/1.1 200 OK
+LiveResource-Property: wait; min=20
+...
+```
 
-For realtime updates, the client provides a Wait header to make the request act as a long poll:
+The other way is for the server to hint at this capability in advance, using the `wait-min` link parameter:
+
+```http
+HEAD /collection/ HTTP/1.1
+...
+
+HTTP/1.1 200 OK
+Link: </collection/?after=1395174448&max=50>; rel=http://liveresource.org/protocol/changes; wait-min=20
+...
+```
+
+This way a separate discovery request is avoided.
+
+Unlike value updates which use ETags, changes updates encode checkpoint information in the provided changes URI. The client should request against this URI to receive updates of the resource.
+
+The changes URI should return all changes that have occurred after some recent checkpoint (such as a timestamp). If no changes have occurred, the response must have a way to indicate this (e.g. empty body, empty JSON object or list, etc). Regardless of whether there were changes or not, the response code SHOULD be 200.
+
+The changes URIs MAY have a limited validity period. If the server considers a URI too old to process, it can return 404, which should signal the client to start over and obtain a fresh changes URI.
+
+The client provides a `Prefer` header to make the request act as a long poll:
 
 ```http
 GET /collection/?after=1395174448&max=50 HTTP/1.1
-Wait: 60
+Prefer: wait=60
 ...
 ```
 
-Any request can be made against a resource to receive a changes URIs. For example, a news feed may want to obtain the most recent N news items and be notified of updates going forward. To accomplish this, the client could make a request to a collection resource of news items, perhaps with certain query parameters indicating an "order by created_time desc limit N" effect. The client would then receive these items and use them for initial display. The response to this request would also contain changes URIs though, which the client could then begin long-polling against to receive any changes.
+Any request can be made against a resource to receive a changes URI. For example, a news feed may want to obtain the most recent N news items and be notified of updates going forward. To accomplish this, the client could make a request to a collection resource of news items, perhaps with certain query parameters indicating an "order by created time desc limit N" effect. The client would then receive these items and use them for initial display. The response to this request would also contain a changes URI, which the client could then begin long-polling against to receive any changes.
 
-### Webhooks
+### Stream
 
-A resource can indicate support for update notifications via callback by including a `callback` link type:
+A resource can indicate support for notifications via Server-Sent Events by including an `alternate` link for content type `text/event-stream`:
 
 ```http
 GET /object HTTP/1.1
@@ -188,7 +213,37 @@ GET /object HTTP/1.1
 
 HTTP/1.1 200 OK
 ETag: "b1946ac9"
-Link: </object/subscription/>; rel=value-callback
+Link: </object/stream/>; rel=alternate; type=text/event-stream
+...
+```
+
+The link points to a Server-Sent Events capable endpoint that streams updates related to the resource. The client can then access the stream:
+
+```http
+GET /object/stream/ HTTP/1.1
+Accept: text/event-stream
+...
+
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+...
+```
+
+Event IDs MAY be used to allow recovery after disconnect. For example, a stream of value updates might use ETags for event IDs. Events have name `update`. The first line of the event data are the headers encoded in a JSON object. The second line and any lines after that is the resource content. The content SHOULD be the same as would be returned with regular GET requests, for value or changes.
+
+Streamed hint updates simply have no data.
+
+### Callbacks
+
+A resource can indicate support for update notifications via callbacks (webhooks) by including link relationships of `http://liveresource.org/protocol/callbacks` and/or `http://liveresource.org/protocol/changes-callbacks`.
+
+```http
+GET /object HTTP/1.1
+...
+
+HTTP/1.1 200 OK
+ETag: "b1946ac9"
+Link: </object/subscriptions/>; rel=http://liveresource.org/protocol/callbacks
 ...
 ```
 
@@ -197,7 +252,7 @@ The link points to a collection resource that manages callback URI registrations
 To subscribe `http://example.org/receiver/` to a resource:
 
 ```http
-POST /object/subscription/ HTTP/1.1
+POST /object/subscriptions/ HTTP/1.1
 Content-Type: application/x-www-form-urlencoded
 
 callback_uri=http:%2F%2Fexample.org%2Freceiver%2F
@@ -207,60 +262,32 @@ Server responds:
 
 ```http
 HTTP/1.1 201 Created
-Location: http://example.com/object/subscription/http:%2F%2Fexample.org%2Freceiver%2F
+Location: http://example.com/object/subscriptions/http:%2F%2Fexample.org%2Freceiver%2F
 Content-Length: 0
 ```
 
 The subscription's id will be the encoded URI that was subscribed. To unsubscribe, delete the subscription's resource URI:
 
 ```http
-DELETE /object/subscription/http:%2F%2Fexample.org%2Freceiver%2F HTTP/1.1
+DELETE /object/subscriptions/http:%2F%2Fexample.org%2Freceiver%2F HTTP/1.1
 ```
 
-Update notifications are delivered via HTTP POST to each subscriber URI. The Location header is set to the value of the resource that was subscribed to. For example:
+Update notifications are delivered via HTTP POST to each subscriber URI. The `Location` header is set to the value of the resource that was subscribed to. For example:
 
 ```http
 POST /receiver/ HTTP/1.1
+Host: example.org
 Location: http://example.com/object
 ...
 ```
 
 In the case of value updates, the body of the POST request contains the entire value. If the resource was deleted, then an empty body is sent.
 
-For changes updates, the POST request body contains the response that would normally have been sent to a request for the changes URI. The request should also contain two additional headers, `Changes-Id` and `Previous-Changes-Id`. The recipient can compare the currently known changes ID with the previous changes ID to ensure a callback was not missed. If it was, the client can resync by performing a GET against the currently known `changes` link.
-
-### Server-Sent Events
-
-A resource can indicate support for notifications via Server-Sent Events by including a `stream` Link type:
-
-```http
-GET /object HTTP/1.1
-...
-
-HTTP/1.1 200 OK
-ETag: "b1946ac9"
-Link: </object/stream/>; rel=value-stream
-...
-```
-
-The link points to a Server-Sent Events capable endpoint that streams updates related to the resource. The client can then access the stream:
-
-```http
-GET /object/stream/ HTTP/1.1
-...
-
-HTTP/1.1 200 OK
-Content-Type: text/event-stream
-...
-```
-
-Event ids should be used to allow recovery after disconnect. For example, a value stream might use ETags for event ids. Events have name `update`. The first line of the event data are the headers encoded in a JSON object. The second line and any lines after that is the resource content. The content SHOULD be the same as would be returned with regular GET requests, for value or changes.
-
-Streamed hint updates simply have no data.
+For changes updates, the POST request body contains the response that would normally have been sent to a request for the changes URI. The request should also contain two additional headers, `Changes-Id` and `Previous-Changes-Id`. The recipient can compare the currently known changes ID with the previous changes ID to ensure a callback was not missed. If it was, the client can resync by performing a GET against the currently known `http://liveresource.org/protocol/changes` link.
 
 ### Multiplexing
 
-In order to reduce the number of needed TCP connections in client applications, servers may support multiplexing many long-polling requests or streams together. This is indicated by providing links of type `multiplex-wait` and/or `multiplex-socket`. For example, suppose there are two resource URIs of interest:
+In order to reduce the number of needed TCP connections in client applications (or the number of callback registration endpoints in the case of callbacks), servers may support multiplexing connections or callback registration endpoints to handle multiple URIs at the same time. This is indicated by providing links relationships `multiplex-request`, `multiplex-socket`, and/or `multiplex-callbacks`. For example, suppose there are two resource URIs of interest:
 
 ```http
 GET /objectA HTTP/1.1
@@ -268,8 +295,8 @@ GET /objectA HTTP/1.1
 
 HTTP/1.1 200 OK
 ETag: "b1946ac9"
-Link: </objectA>; rel=value-wait
-Link: </multi/>; rel=multiplex-wait
+LiveResource-Property: wait; min=20, multiplex=request
+Link: </multi/>; rel=http://liveresource.org/protocol/multiplex-request; wait-min=20
 ...
 
 GET /objectB HTTP/1.1
@@ -277,18 +304,18 @@ GET /objectB HTTP/1.1
 
 HTTP/1.1 200 OK
 ETag: "d3b07384"
-Link: </objectB>; rel=value-wait
-Link: </multi/>; rel=multiplex-wait
+LiveResource-Property: wait; min=20, multiplex=request
+Link: </multi/>; rel=http://liveresource.org/protocol/multiplex-request; wait-min=20
 ...
 ```
 
-The client can detect that both of these resources are accessible via the same multiplex endpoint `/multi/`. Both resources can then be checked for updates in a single long-polling request. This is done by passing each resource URI as in a `Uri` header. For values updates, each `Uri` header should contain an `If-None-Match` parameter specifying the ETag to check against. For changes updates, the `If-None-Match` parameter is not needed, since the checkpoint is encoded in the URI itself.
+The client can detect that both of these resources are accessible via the same multiplex-request endpoint `/multi/`. Both resources can then be checked for updates in a single long-polling request. This is done by passing each resource URI as in a `Uri` request header. For values updates, each `Uri` header should contain an `If-None-Match` parameter specifying the ETag to check against. For changes updates, the `If-None-Match` parameter is not needed, since the checkpoint information is encoded in the URI itself.
 
 ```http
 GET /multi/ HTTP/1.1
 Uri: </objectA>; If-None-Match="b1946ac9"
 Uri: </objectB>; If-None-Match="d3b07384"
-Wait: 60
+Prefer: wait=60
 ...
 ```
 
@@ -309,11 +336,9 @@ Content-Type: application/liveresource-multiplex
 }
 ```
 
-If the request is a long-polling request and only one URI has response data, then response data for the others should not be included.
+If the request is a long-polling request and only one URI has response data, then response data for the others SHOULD NOT be included.
 
-To make hint requests in a multiplex request, include a `method=HEAD` parameter in the `Uri` header.
-
-For WebSockets, a resource can indicate support by including a `multiplex-socket` link type:
+For WebSockets, a resource can indicate support for `socket` multiplexing:
 
 ```http
 GET /object HTTP/1.1
@@ -321,11 +346,12 @@ GET /object HTTP/1.1
 
 HTTP/1.1 200 OK
 ETag: "b1946ac9"
-Link: </updates/>; rel=multiplex-socket
+LiveResource-Property: multiplex=socket
+Link: </ws/>; rel=http://liveresource.org/protocol/multiplex-socket
 ...
 ```
 
-The link points to a WebSocket capable endpoint. The client can then connect to establish a bi-directional session for handling subscriptions to resources and receiving notifications about them. The client and server must negotiate the `liveresource` protocol using `Sec-WebSocket-Protocol` headers. The wire protocol uses JSON-formatted messages.
+The link points to a WebSocket capable endpoint. The client can then connect to establish a bi-directional session for handling subscriptions to resources and receiving notifications about them. The client and server MUST negotiate the `liveresource` protocol using `Sec-WebSocket-Protocol` headers. The wire protocol uses JSON-formatted messages.
 
 Once connected, the client can subscribe to a resource:
 
@@ -362,8 +388,19 @@ The server notifies the client by sending a message:
 
 The first line includes any updated headers of the resource encoded in JSON. All remaining lines comprise the resource content.
 
-To listen for hint updates, issue a HEAD request instead:
+Hint updates contain only the first line and without the headers part.
 
+For sharing a callback registration endpoint with many resources, a resource can indicate support for `callbacks` multiplexing:
+
+```http
+GET /object HTTP/1.1
+...
+
+HTTP/1.1 200 OK
+ETag: "b1946ac9"
+LiveResource-Property: multiplex=callbacks
+Link: </hooks/>; rel=http://liveresource.org/protocol/multiplex-callbacks
+...
 ```
-HEAD /objectA
-```
+
+When the client registers a callback URI by making a POST request to the `/hooks/` endpoint, it includes a `uri` parameter specifying the resource of interest.
